@@ -45,6 +45,8 @@ ticketforjira() {
         echo ""
         echo "-c, --current: Show all tickets in the current sprint only"
         echo ""
+        echo "--json: Print tickets as a JSON array and exit (non-interactive, no fzf)"
+        echo ""
         echo "Tickets can be searched by fuzzy searching"
         echo "Selecting a ticket will move on to the next step where you can manipulate the ticket"
         echo "The ticket can be moved to a different status column, or closed"
@@ -136,11 +138,15 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     }
     show_all=false
     only_list=false
+    output_json=false
     for arg in "$@"; do
         case $arg in
             -h | --help)
                 show_help
                 return 0
+                ;;
+            --json)
+                output_json=true
                 ;;
             -a | --all)
                 show_all=true
@@ -224,67 +230,69 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     fi
     # api token
     jira_api_token=$JIRA_API_TOKEN
-    if [ "$jira_api_token" == "" ]; then
-        if command -v pass &>/dev/null; then
-            jira_api_token=$(pass jiraapi)
-            # try to read token from env
-        else
-            echo "neither pass nor JIRA_API_TOKEN is set, please set the jira_api_token environment variable or install pass and add the jiraapi password"
-            return 1
-        fi
+    if [ "$jira_api_token" == "" ] && command -v pass &>/dev/null; then
+        jira_api_token=$(pass jiraapi)
     fi
-    # get the repo owner
-    gh_name=$(git remote get-url origin | sed -e 's/.*github.com\///' -e 's/\/.*//')
-    gh_name=${gh_name#*:}
-    # to lower case
-    gh_name=${gh_name,,}
-    # get the name up to the first dash
-    repo_owner=${gh_name%%-*}
-    repo_owner=${repo_owner,,}
-    # get the repo name from path
-    repo_name=$(basename $(git rev-parse --show-toplevel))
-    # WARN: this is a hack, we should get the prefix from the issue? Maybe the labels?
-    # repo name should start with AI but doesn't, lets pretend it does
-    # repo_name="AI-$repo_name"
-    project_name=${repo_name%%-*}
-    project_name=${project_name,,}
+    # macOS Keychain fallback: used when neither $JIRA_API_TOKEN nor pass yields a
+    # token (e.g. non-interactive shells where pass's TTY pinentry can't prompt).
+    # Populate once with:
+    #   security add-generic-password -s jiraapi -a "$(git config user.email)" -w <token>
+    if [ "$jira_api_token" == "" ] && command -v security &>/dev/null; then
+        jira_api_token=$(security find-generic-password -s jiraapi -a "$jira_email" -w 2>/dev/null)
+    fi
+    if [ "$jira_api_token" == "" ]; then
+        echo "no jira api token: set JIRA_API_TOKEN, add 'jiraapi' to pass, or store it in the macOS Keychain (security add-generic-password -s jiraapi -a \"\$(git config user.email)\" -w <token>)"
+        return 1
+    fi
+    # Resolve the Jira site and project key from the repo's .jira file.
+    # If it is missing (or incomplete), prompt with guesses and persist it.
+    # .jira holds only routing metadata (no secrets); commit it to share with the team.
+    repo_root=$(git rev-parse --show-toplevel)
+    jira_file="$repo_root/.jira"
+    jira_site=""
+    project_key=""
+    if [ -f "$jira_file" ]; then
+        jira_site=$(grep -E '^JIRA_SITE=' "$jira_file" | head -1 | cut -d= -f2-)
+        project_key=$(grep -E '^JIRA_PROJECT=' "$jira_file" | head -1 | cut -d= -f2-)
+    fi
+    if [ -z "$jira_site" ] || [ -z "$project_key" ]; then
+        # Prefill guesses from the remote and branch so the common case is a single Enter.
+        gh_name=$(git remote get-url origin | sed -e 's#.*github\.com[/:]##' -e 's#/.*##')
+        gh_name=${gh_name,,}
+        guess_site=${jira_site:-${gh_name%%-*}}
+        branch_key=$(git rev-parse --abbrev-ref HEAD | sed -nE 's#^([a-zA-Z]+/)?([A-Za-z]+)[-_]?[0-9].*#\2#p')
+        guess_key=${project_key:-${branch_key:-$(basename "$repo_root")}}
+        guess_key=${guess_key%%-*}
+        guess_key=${guess_key^^}
+        echo "No Jira config (.jira) found for this repo."
+        read -r -p "Jira site (https://<site>.atlassian.net) [$guess_site]: " in_site
+        read -r -p "Jira project key [$guess_key]: " in_key
+        jira_site=${in_site:-$guess_site}
+        project_key=${in_key:-$guess_key}
+        printf 'JIRA_SITE=%s\nJIRA_PROJECT=%s\n' "$jira_site" "$project_key" > "$jira_file"
+        echo "Wrote $jira_file - commit it to share with your team."
+    fi
+    jira_site=${jira_site,,}
+    project_key=${project_key^^}
 
-    projects_url="https://${repo_owner}.atlassian.net/rest/api/3/project/search"
-    # Fetch project overview
+    project_url="https://${jira_site}.atlassian.net/rest/api/3/project/${project_key}"
     response=$(curl -s -X GET \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \
-        "$projects_url")
+        "$project_url")
 
-    # echo "response: $response"
-    # Check if the response is valid
     if [[ -z "$response" ]]; then
         echo "Failed to fetch project data."
         return 1
     fi
 
-    keys=$(echo "$response" | jq -r '.values[] | .key')
-
-    if [[ -z "$keys" ]]; then
-        echo "No projects found"
-        return 1
-    fi
-    # search for the project in the keys, keys are one per line, we need to subtract 1 from the line number
-    line_number=$(echo "$keys" | grep -i -n "$project_name" | cut -d ":" -f 1)
-    # Subtract 1 from the line number
-    if [[ -n "$line_number" ]]; then
-        matched_project_index=$((line_number - 1))
-    fi
-    matched_project=$(echo "$keys" | grep -i "$project_name")
-    if [ -z "$matched_project" ]; then
-        echo "Project '$project_name' not found"
+    project_id=$(echo "$response" | jq -r '.id // empty')
+    if [ -z "$project_id" ]; then
+        echo "Project '$project_key' not found"
         return 1
     fi
 
-    # get the project id
-    project_id=$(echo "$response" | jq -r '.values['$matched_project_index'] | .id')
-
-    boards_url="https://${repo_owner}.atlassian.net/rest/agile/1.0/board"
+    boards_url="https://${jira_site}.atlassian.net/rest/agile/1.0/board?projectKeyOrId=${project_id}"
     bresponse=$(curl -s -X GET \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \
@@ -296,10 +304,10 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
         return 1
     fi
 
-    board_id=$(echo "$bresponse" | jq -r '.values[] | select(.location.projectId == '$project_id') | .id')
+    board_id=$(echo "$bresponse" | jq -r '.values[0].id // empty')
 
     # get the people on the project
-    people_url="https://${repo_owner}.atlassian.net/rest/api/3/user/assignable/search?project=$project_id&startAt=0&maxResults=50"
+    people_url="https://${jira_site}.atlassian.net/rest/api/3/user/assignable/search?project=$project_id&startAt=0&maxResults=50"
     people_response=$(curl -s -X GET \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \
@@ -315,7 +323,7 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     people_ids=$(echo "$people_response" | jq -r '.[] | .accountId')
 
     # get the issues
-    issues_url="https://${repo_owner}.atlassian.net/rest/agile/1.0/board/$board_id/issue"
+    issues_url="https://${jira_site}.atlassian.net/rest/agile/1.0/board/$board_id/issue"
     # WARN: hardcoded maxResults
     maxResults=800
     fields="id,key,summary,status,assignee,created,issuetype,labels,parent,sprint,customfield_10016"
@@ -334,6 +342,24 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     if [[ -z "$issues_response" ]]; then
         echo "Failed to fetch issues."
         return 1
+    fi
+
+    # non-interactive JSON output for tooling/automation (skips fzf and the rest of the flow)
+    if [ "$output_json" = true ]; then
+        json_filter='true'
+        [ "$only_current" = true ] && json_filter='.fields.sprint != null'
+        echo "$issues_response" | jq "[.issues[] | select($json_filter) | {
+            key,
+            summary: .fields.summary,
+            status: .fields.status.name,
+            type: .fields.issuetype.name,
+            assignee: (.fields.assignee.displayName // null),
+            storypoints: (.fields.customfield_10016 | if . == null then null else floor end),
+            labels: .fields.labels,
+            parent: (.fields.parent.key // null),
+            created: .fields.created
+        }]"
+        return 0
     fi
 
     # window width
@@ -412,7 +438,7 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     issue_num=$(echo "$issuei" | awk '{$1=$1};1' | awk '{print $1}')
 
     # print the issue, first we get the full issue
-    issues_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num"
+    issues_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num"
     full_issue=$(curl -s -X GET \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \
@@ -427,7 +453,7 @@ else "\(.fields.parent.key)\t\(.fields.parent.fields.summary)\t\(
     print_issue "$full_issue"
     # status options:
     # actions should be the possible transitions
-    transitions_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
+    transitions_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
     response=$(curl -s -X GET \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \
@@ -525,7 +551,7 @@ null    null    Show parent"
         issue_num=$(echo "$issuei" | awk '{$1=$1};1' | awk '{print $1}')
         echo -e "\n\033[0;36m\n############## Child ##############\033[0m\n"
         # print the issue, first we get the full issue
-        issues_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num"
+        issues_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num"
         full_issue=$(curl -s -X GET \
             -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
             -H "Accept: application/json" \
@@ -549,7 +575,7 @@ null    null    Show parent"
         issue_num=$(echo "$issuei" | awk '{$1=$1};1' | awk '{print $1}')
         echo -e "\n\033[0;36m\n############## Parent ##############\033[0m\n"
         # print the issue, first we get the full issue
-        issues_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num"
+        issues_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num"
         full_issue=$(curl -s -X GET \
             -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
             -H "Accept: application/json" \
@@ -572,7 +598,7 @@ null    null    Show parent"
         return 0
     elif [ "$status_name" == "Close issue" ]; then
         check_yes_no_internal "Close issue $full_issue_key? [Y/n]: "
-        transit_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
+        transit_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
         response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
             -H "Accept: application/json" \
@@ -627,7 +653,7 @@ null    null    Show parent"
 
                 # echo "Assigning $assignee with id $assignee_id to $full_issue_key"
 
-                assign_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num/assignee"
+                assign_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num/assignee"
                 response=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
                     -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
                     -H "Accept: application/json" \
@@ -727,7 +753,7 @@ null    null    Show parent"
         fi
     fi
     # move the ticket to the new status
-    transit_url="https://${repo_owner}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
+    transit_url="https://${jira_site}.atlassian.net/rest/api/3/issue/$issue_num/transitions"
     response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
         -H "Authorization: Basic $(echo -n "$jira_email:$jira_api_token" | base64)" \
         -H "Accept: application/json" \

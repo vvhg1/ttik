@@ -9,6 +9,14 @@ source "$SCRIPT_DIR/ticketforjira.sh"
 # This script checks the remote of a repo and either forwards to the script for github or gitea
 
 ticketcrossroad() {
+    # explicit config wins: a .jira file binds this repo to a jira project,
+    # regardless of any github project attached to the remote.
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$repo_root" ] && [ -f "$repo_root/.jira" ]; then
+        ticketforjira "$@"
+        return
+    fi
+
     remote=$(git remote -v | grep fetch | awk '{print $2}')
 
     if [[ $remote == *"github.com"* ]]; then
